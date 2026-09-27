@@ -1,0 +1,822 @@
+#!/usr/bin/env bash
+# cptsrep v3 — CPTS / SysReptor workstation
+set -euo pipefail
+
+VERSION="3.0.0"
+VAULT="${CPTSREP_VAULT:-$HOME/.cptsrep}"
+EDITOR_BIN="${EDITOR:-vim}"
+PRESETS=(hosts vhosts exploited users flags cleanup findings remediations)
+
+header_of() {
+  case "$1" in
+    hosts)        echo $'Host\tIP Address\tPort\tProtocol\tService\tVersion / Notes' ;;
+    vhosts)       echo $'URL\tDescription\tHow Discovered' ;;
+    exploited)    echo $'Host\tScope\tMethod\tNotes' ;;
+    users)        echo $'Username\tHost / Domain\tMethod\tNotes' ;;
+    flags)        echo $'Flag #\tHost\tFlag Value\tFlag Location\tMethod Used' ;;
+    cleanup)      echo $'Host\tChange\tReason\tReverted (Y/N)' ;;
+    findings)     echo $'ID\tTitle\tCWE\tCVSS\tHost\tStatus' ;;
+    remediations) echo $'Term\tFinding\tAction' ;;
+    *) return 1 ;;
+  esac
+}
+
+usage() {
+  cat <<EOF
+cptsrep v$VERSION
+
+EXAM LOOP
+  cptsrep init
+  cptsrep nmap scan.nmap          # after every nmap
+  cptsrep hosts                   # fix rows in vim, paste into Appendix
+  cptsrep finding new ear         # typed finding file + tracker row
+  cptsrep walkthrough start previse
+  cptsrep flag 1 previse.htb VALUE /path "method"
+  cptsrep trigger                 # what to fill RIGHT NOW
+  cptsrep dump                    # all appendix markdown
+  cptsrep next                    # checklist of empty tables
+
+TABLES (vim TSV)
+  cptsrep hosts|vhosts|exploited|users|flags|cleanup|findings|remediations
+
+FINDINGS
+  cptsrep finding new <type> [title-slug]
+      types: ear rce sqli cmdi path creds default xss idor pth ptt lfi
+  cptsrep finding list
+  cptsrep finding edit <id>
+  cptsrep finding-stub [type]
+
+WALKTHROUGH
+  cptsrep walkthrough start <host>
+  cptsrep walkthrough edit <host>
+  cptsrep walkthrough dump
+
+OTHER
+  cptsrep add <preset> <tab-row>
+  cptsrep show|clip <preset>
+  cptsrep validate | list | export <dir>
+  cptsrep figure <id> <caption>
+  cptsrep remediate short|medium|long "<finding>" "<action>"
+  cptsrep scope-stub | approach-ok
+
+Tabs separate columns. Never delete the header line.
+Vault: $VAULT
+EOF
+}
+
+die() { echo "cptsrep: $*" >&2; exit 1; }
+need_vault() { [[ -d "$VAULT" ]] || die "no vault — run: cptsrep init"; }
+tsv_path() { echo "$VAULT/$1.tsv"; }
+ensure_preset() {
+  local f; f="$(tsv_path "$1")"
+  [[ -f "$f" ]] || header_of "$1" > "$f"
+}
+
+init_vault() {
+  VAULT="${1:-$VAULT}"
+  mkdir -p "$VAULT/findings" "$VAULT/walkthrough" "$VAULT/export"
+  local p
+  for p in "${PRESETS[@]}"; do
+    [[ -f "$(tsv_path "$p")" ]] || header_of "$p" > "$(tsv_path "$p")"
+  done
+  [[ -f "$VAULT/nmap.cmd" ]] || echo "nmap -sC -sV -oA nmap/target <IP>" > "$VAULT/nmap.cmd"
+  cat > "$VAULT/README" <<'EOR'
+Put CPTSREP_VAULT in this folder during the exam.
+Flow: nmap → hosts → finding new → walkthrough → flag → dump
+EOR
+  echo "vault ready: $VAULT"
+}
+
+md_to_tsv() {
+  awk '{
+    line=$0; gsub(/\r$/,"",line)
+    if (line ~ /^[[:space:]]*$/) next
+    if (line ~ /^[[:space:]]*\|?[[:space:]]*-{3,}/) next
+    if (line ~ /\|/) {
+      gsub(/^\|/,"",line); gsub(/\|$/,"",line)
+      n=split(line,a,"|"); out=""
+      for (i=1;i<=n;i++) { gsub(/^[[:space:]]+|[[:space:]]+$/,"",a[i]); out=out (i==1?"":"\t") a[i] }
+      print out
+    } else print line
+  }'
+}
+
+tsv_to_md() {
+  awk -F '\t' '{
+    nr++; if (NF>cols) cols=NF
+    for (i=1;i<=NF;i++) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/,"",$i)
+      cell[nr,i]=$i
+      if (length($i)>w[i]) w[i]=length($i)
+    }
+  }
+  END {
+    if (!nr) exit
+    for (i=1;i<=cols;i++) if (w[i]<3) w[i]=3
+    for (r=1;r<=nr;r++) {
+      for (i=1;i<=cols;i++) printf "| %-*s ", w[i], (cell[r,i] ? cell[r,i] : "")
+      printf "|\n"
+      if (r==1) {
+        for (i=1;i<=cols;i++) {
+          d=""; for (j=1;j<=w[i];j++) d=d "-"
+          printf "| %s ", d
+        }
+        printf "|\n"
+      }
+    }
+  }'
+}
+
+clip() {
+  if command -v wl-copy >/dev/null 2>&1; then printf '%s\n' "$1" | wl-copy
+  elif command -v xclip >/dev/null 2>&1; then printf '%s\n' "$1" | xclip -selection clipboard
+  elif command -v xsel >/dev/null 2>&1; then printf '%s\n' "$1" | xsel --clipboard
+  else return 1
+  fi
+}
+
+show_md() { need_vault; ensure_preset "$1"; tsv_to_md < "$(tsv_path "$1")"; }
+
+edit_preset() {
+  need_vault
+  header_of "$1" >/dev/null || die "unknown preset: $1"
+  ensure_preset "$1"
+  local f tmp; f="$(tsv_path "$1")"; tmp="$(mktemp /tmp/cptsrep.XXXXXX)"
+  cp "$f" "$tmp"
+  "$EDITOR_BIN" "$tmp"
+  [[ -s "$tmp" ]] || { echo "empty — discarded" >&2; rm -f "$tmp"; return 1; }
+  cp "$tmp" "$f"; rm -f "$tmp"
+  echo "saved $f" >&2
+  local md; md="$(show_md "$1")"
+  printf '%s\n' "$md"
+  clip "$md" && echo "[clipboard]" >&2 || true
+}
+
+add_row() {
+  need_vault; ensure_preset "$1"; shift
+  printf '%s\n' "$*" >> "$(tsv_path "$1")"
+  show_md "$1"
+}
+
+ingest_nmap() {
+  need_vault
+  local file="${1:-}"
+  [[ -n "$file" && -f "$file" ]] || die "usage: cptsrep nmap <nmap -oN/-oG file>"
+  ensure_preset hosts
+  local tmp; tmp="$(mktemp)"
+  if grep -q '^Host:' "$file" 2>/dev/null; then
+    awk '
+      /^Host:/ {
+        ip=$2; host=""
+        if ($3 ~ /^\(/) { host=$3; gsub(/[()]/,"",host) }
+        if (host=="" || host=="hostname") host=ip
+      }
+      /Ports:/ {
+        n=split($0, a, ",")
+        for (i=1;i<=n;i++) {
+          s=a[i]
+          if (s ~ /[0-9]+\/open\//) {
+            gsub(/^.*Ports: /,"",s)
+            split(s, p, "/")
+            port=p[1]; gsub(/[^0-9]/,"",port)
+            proto=p[3]; svc=p[5]; ver=p[7]
+            if (port!="") printf "%s\t%s\t%s\t%s\t%s\t%s\n", host, ip, port, proto, svc, ver
+          }
+        }
+      }
+    ' "$file" > "$tmp"
+  else
+    awk '
+      /^Nmap scan report/ {
+        host=$5; ip=$5
+        if ($0 ~ /\(/) { host=$5; ip=$6; gsub(/[()]/,"",ip) }
+      }
+      /^[0-9]+\/(tcp|udp)[[:space:]]+open/ {
+        split($1,a,"/"); port=a[1]; proto=a[2]; svc=$3; ver=""
+        for (i=4;i<=NF;i++) ver=ver (ver==""?"":" ") $i
+        printf "%s\t%s\t%s\t%s\t%s\t%s\n", host, ip, port, proto, svc, ver
+      }
+    ' "$file" > "$tmp"
+  fi
+  declare -A seen=()
+  local line key added=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    key="$(printf '%s' "$line" | awk -F '\t' '{print $1":"$3":"$4}')"
+    seen["$key"]=1
+  done < "$(tsv_path hosts)"
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    key="$(printf '%s' "$line" | awk -F '\t' '{print $1":"$3":"$4}')"
+    if [[ -z "${seen[$key]:-}" ]]; then
+      printf '%s\n' "$line" >> "$(tsv_path hosts)"
+      seen["$key"]=1
+      added=$((added+1))
+    fi
+  done < "$tmp"
+  rm -f "$tmp"
+  echo "nmap -sC -sV -oA nmap/$(basename "${file%.*}") " >> "$VAULT/nmap.cmd" || true
+  echo "merged $added new port row(s)" >&2
+  show_md hosts
+  echo
+  echo "**Nmap command used:**"
+  echo '`nmap -sC -sV -oA nmap/target <IP>`'
+}
+
+add_flag() {
+  need_vault; ensure_preset flags
+  local n="${1:-}" host="${2:-}" val="${3:-}" loc="${4:-}"
+  shift 4 || true
+  local method="$*"
+  [[ -n "$n" && -n "$host" ]] || die "usage: cptsrep flag <n> <host> <value> <path> <method>"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$host" "$val" "$loc" "$method" >> "$(tsv_path flags)"
+  echo "flag $n saved" >&2
+  show_md flags
+}
+
+next_id() {
+  local n=1 f
+  for f in "$VAULT/findings"/[0-9][0-9]-*.md; do
+    [[ -e "$f" ]] || break
+    n=$((n+1))
+  done
+  printf '%02d' "$n"
+}
+
+finding_body() {
+  local type="${1:-default}" slug="${2:-finding}"
+  case "$type" in
+    ear)
+      cat <<EOF
+# Execution After Redirect (EAR) allowing unauthenticated access
+
+**CWE:** CWE-698
+**CVSS:** 7.5 (AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N)
+
+## Overview
+The application issued an HTTP redirect to the login page but still returned the body of a privileged resource. An unauthenticated assessor retrieved and interacted with that page.
+
+## Impact
+Unauthenticated users can reach functionality intended for administrators, which enabled account creation and further compromise.
+
+## Affected components
+- Host:
+- URL:
+- User: unauthenticated
+
+## Recommendations
+- Short: Enforce authorization after the redirect; return 302 with an empty body or die() after header().
+- Medium: Regression-test all auth gates for EAR.
+
+## References
+- CWE-698: Execution After Redirect
+- OWASP: Unvalidated Redirects
+
+## Details
+1. Requested the protected resource without a session.
+2. Server responded \`302 Location: login.php\` **and** the full privileged HTML.
+3. The assessor used the returned body / followed with a crafted request.
+4. Screenshot of request and response.
+5. This bypassed authentication and led to the next finding.
+EOF
+      ;;
+    rce|cmdi)
+      cat <<EOF
+# OS command injection leading to remote code execution
+
+**CWE:** CWE-78
+**CVSS:** 9.8 (AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H)
+
+## Overview
+User-controlled input was concatenated into a shell command and executed by the application without sanitization.
+
+## Impact
+The assessor obtained a shell as the service account and used it to read credentials and escalate.
+
+## Affected components
+- Host:
+- Parameter / endpoint:
+- User: (service account)
+
+## Recommendations
+- Short: Remove shell execution; use safe APIs and an allowlist.
+- Medium: Run the service as an unprivileged user; add WAF/logging.
+
+## References
+- CWE-78: OS Command Injection
+- OWASP A03:2021 Injection
+
+## Details
+1. Identified the injectable parameter.
+2. Exact request / payload (code block).
+3. Command output / reverse shell.
+4. Screenshot.
+5. This provided the foothold used in the walkthrough.
+EOF
+      ;;
+    path)
+      cat <<EOF
+# Privilege escalation via PATH hijacking in a sudo script
+
+**CWE:** CWE-426
+**CVSS:** 7.8 (AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H)
+
+## Overview
+A sudo-allowed script invoked a binary by relative name. The assessor placed a malicious binary earlier in PATH and obtained root.
+
+## Impact
+Full compromise of the host (root).
+
+## Affected components
+- Host:
+- Sudo command:
+- User: (sudoers user)
+
+## Recommendations
+- Short: Use absolute paths in the script; remove sudo if unused.
+- Medium: Remove world-writable directories from root PATH; audit sudoers.
+
+## References
+- CWE-426: Untrusted Search Path
+- GTFOBins / sudo PATH hijack
+
+## Details
+1. \`sudo -l\` showed the script.
+2. Script called \`gzip\` without an absolute path.
+3. Malicious wrapper in a writable PATH directory.
+4. Screenshot of sudo -l, script, and root shell.
+5. Led to root.txt.
+EOF
+      ;;
+    creds)
+      cat <<EOF
+# Hardcoded / recoverable credentials
+
+**CWE:** CWE-798
+**CVSS:** 7.5
+
+## Overview
+Credentials were stored in source, config, or a database in a recoverable form.
+
+## Impact
+The assessor reused the credential to authenticate as another user / service.
+
+## Affected components
+- Host:
+- Location of secret:
+- Account:
+
+## Recommendations
+- Short: Rotate the credential; remove it from the file.
+- Medium: Secrets manager; no secrets in web roots.
+
+## References
+- CWE-798: Use of Hard-coded Credentials
+
+## Details
+1. Where the secret was found.
+2. Command used to retrieve it.
+3. Cracking / reuse.
+4. Screenshot.
+5. What access it unlocked.
+EOF
+      ;;
+    pth)
+      cat <<EOF
+# Pass the Hash allowing authentication without the plaintext password
+
+**CWE:** CWE-294
+**CVSS:** 8.8
+
+## Overview
+An NTLM hash recovered from memory or NTDS was reused to authenticate to another host.
+
+## Impact
+Lateral movement and access to additional systems without cracking the password.
+
+## Affected components
+- Source host:
+- Target host:
+- Account:
+
+## Recommendations
+- Short: Disable NTLM where possible; enable Restricted Admin / Protected Users.
+- Medium: Credential Guard; tiered admin; rotate after dump.
+
+## References
+- CWE-294: Authentication Bypass by Capture-replay
+- Microsoft: Pass-the-Hash mitigations
+
+## Details
+1. How the hash was obtained.
+2. Exact command (impacket / nxc / RDP PTH).
+3. Resulting session.
+4. Screenshot.
+5. Next hop.
+EOF
+      ;;
+    ptt)
+      cat <<EOF
+# Pass the Ticket using a stolen Kerberos TGT
+
+**CWE:** CWE-294
+**CVSS:** 8.8
+
+## Overview
+A Kerberos ticket exported from a compromised session was imported and used to access another resource.
+
+## Impact
+Impersonation of the ticket owner against domain services.
+
+## Affected components
+- Source:
+- Target:
+- Principal:
+
+## Recommendations
+- Short: Expire sessions; reset KRBTGT if forged tickets suspected (carefully).
+- Medium: Protected Users; shorten TGT lifetime; monitor ticket anomalies.
+
+## References
+- CWE-294
+- MITRE ATT&CK T1550.003
+
+## Details
+1. Ticket export command.
+2. Import / ptt command.
+3. Access obtained.
+4. Screenshot.
+5. Flag / data retrieved.
+EOF
+      ;;
+    sqli)
+      cat <<EOF
+# SQL injection
+
+**CWE:** CWE-89
+**CVSS:** 8.6
+
+## Overview
+Unsanitized input was interpreted as SQL, allowing data disclosure and/or authentication bypass.
+
+## Impact
+Database contents and further access.
+
+## Affected components
+- Host / URL:
+- Parameter:
+
+## Recommendations
+- Short: Parameterized queries; least-privilege DB user.
+- Medium: WAF + code review of all sinks.
+
+## References
+- CWE-89
+- OWASP SQL Injection
+
+## Details
+1. Injection point.
+2. Payload.
+3. Result set / shell.
+4. Screenshot.
+5. Follow-on access.
+EOF
+      ;;
+    lfi)
+      cat <<EOF
+# Local file inclusion / arbitrary file read
+
+**CWE:** CWE-22
+**CVSS:** 7.5
+
+## Overview
+Path input was not constrained; the assessor read sensitive files.
+
+## Impact
+Disclosure of credentials, source, or configuration.
+
+## Details
+1. Parameter.
+2. Traversal payload.
+3. File contents.
+4. Screenshot.
+5. What those files enabled.
+EOF
+      ;;
+    *)
+      cat <<EOF
+# ${slug}
+
+**CWE:** CWE-XXX
+**CVSS:** X.X
+
+## Overview
+Two to four sentences. Business plus technical.
+
+## Impact
+What an attacker gets.
+
+## Affected components
+- Host:
+- Service / URL:
+- User:
+
+## Recommendations
+- Short:
+- Medium:
+
+## References
+- CWE
+
+## Details
+1. What was hit
+2. Exact command or HTTP request
+3. What came back
+4. Screenshot
+5. Why it matters
+EOF
+      ;;
+  esac
+}
+
+finding_new() {
+  need_vault
+  mkdir -p "$VAULT/findings"
+  local type="${1:-default}" slug="${2:-$type}"
+  local id; id="$(next_id)"
+  local file="$VAULT/findings/${id}-${slug}.md"
+  finding_body "$type" "$slug" > "$file"
+  ensure_preset findings
+  printf '%s\t%s\t\t\t\tdraft\n' "$id" "$slug" >> "$(tsv_path findings)"
+  echo "created $file" >&2
+  "$EDITOR_BIN" "$file"
+  echo "paste this finding into SysReptor → Findings → New" >&2
+  echo "$file"
+}
+
+finding_list() {
+  need_vault
+  ls -1 "$VAULT/findings"/*.md 2>/dev/null || echo "(no findings yet)"
+  echo
+  show_md findings
+}
+
+finding_edit() {
+  need_vault
+  local id="${1:-}"
+  local f
+  f="$(ls "$VAULT/findings"/${id}-*.md 2>/dev/null | head -1 || true)"
+  [[ -n "$f" ]] || die "no finding $id"
+  "$EDITOR_BIN" "$f"
+}
+
+walk_start() {
+  need_vault
+  local host="${1:-host}"
+  mkdir -p "$VAULT/walkthrough"
+  local f="$VAULT/walkthrough/${host}.md"
+  if [[ ! -f "$f" ]]; then
+    cat > "$f" <<EOF
+# $host
+
+The assessor targeted **$host** as part of the in-scope assessment.
+
+## High-level
+- Recon
+- Foothold
+- User
+- Privilege escalation
+- Flags
+
+## Detailed reproduction
+
+### Reconnaissance
+Command and ports. Figure.
+
+### Foothold
+Finding reference. Commands. Figure.
+
+### User compromise
+Account. How. Flag location.
+
+### Privilege escalation
+Finding reference. Commands. Figure.
+
+### Cleanup
+Files dropped, services started.
+EOF
+  fi
+  "$EDITOR_BIN" "$f"
+}
+
+walk_dump() {
+  need_vault
+  echo "## Internal Network Compromise Walkthrough"
+  echo
+  echo "### High-level attack path"
+  echo
+  echo "The assessor progressed through the following hosts:"
+  echo
+  local f
+  for f in "$VAULT/walkthrough"/*.md; do
+    [[ -e "$f" ]] || continue
+    echo "- $(basename "$f" .md)"
+  done
+  echo
+  for f in "$VAULT/walkthrough"/*.md; do
+    [[ -e "$f" ]] || continue
+    echo
+    cat "$f"
+    echo
+  done
+}
+
+figure_snip() {
+  local id="${1:-fig1}" caption="${2:-Caption}"
+  cat <<EOF
+<figure id="${id}">
+<figcaption>${caption}</figcaption>
+</figure>
+
+Paste the screenshot in SysReptor, then wrap it with the figure tags above so numbering stays automatic.
+EOF
+}
+
+remediate() {
+  need_vault; ensure_preset remediations
+  local term="${1:-short}" finding="${2:-}" action="${3:-}"
+  printf '%s\t%s\t%s\n' "$term" "$finding" "$action" >> "$(tsv_path remediations)"
+  show_md remediations
+}
+
+validate() {
+  need_vault
+  local bad=0 p f
+  for p in hosts flags; do
+    f="$(tsv_path "$p")"
+    [[ -f "$f" ]] || continue
+    awk -F '\t' -v p="$p" '
+      NR==1 { next }
+      p=="hosts" && ($1=="" || $3=="") { printf "hosts line %d missing host/port\n", NR; bad++ }
+      p=="flags" && $1=="" { printf "flags line %d missing number\n", NR; bad++ }
+      END { exit bad?1:0 }
+    ' "$f" || bad=1
+  done
+  awk -F '\t' 'NR>1 && $1!="" {c[$1]++} END { for (k in c) if (c[k]>1) { print "duplicate flag # " k; e=1 } exit e }' "$(tsv_path flags)" \
+    || bad=1
+  [[ $bad -eq 0 ]] && echo "ok" || echo "fix the rows above" >&2
+  return $bad
+}
+
+dump_all() {
+  need_vault
+  echo "## Host & Service Discovery"
+  echo
+  show_md hosts
+  echo
+  if [[ -f "$VAULT/nmap.cmd" ]]; then
+    echo "**Nmap command used:**"
+    echo "\`$(head -1 "$VAULT/nmap.cmd")\`"
+    echo
+  fi
+  echo "## Subdomain Discovery"
+  echo
+  show_md vhosts
+  echo
+  echo "## Exploited Hosts"
+  echo
+  show_md exploited
+  echo
+  echo "## Compromised Users"
+  echo
+  show_md users
+  echo
+  echo "## Flags Discovered"
+  echo
+  show_md flags
+  echo
+  echo "## Changes / Host Cleanup"
+  echo
+  show_md cleanup
+  echo
+  echo "## Remediation Summary"
+  echo
+  show_md remediations
+}
+
+list_vault() {
+  need_vault
+  echo "vault: $VAULT"
+  local p n
+  for p in "${PRESETS[@]}"; do
+    n=0
+    [[ -f "$(tsv_path "$p")" ]] && n=$(($(wc -l < "$(tsv_path "$p")")-1))
+    printf '  %-14s %2d row(s)\n' "$p" "$n"
+  done
+  echo "  findings dir    $(ls "$VAULT/findings"/*.md 2>/dev/null | wc -l) file(s)"
+  echo "  walkthroughs    $(ls "$VAULT/walkthrough"/*.md 2>/dev/null | wc -l) file(s)"
+}
+
+export_md() {
+  need_vault
+  local dest="${1:-$VAULT/export}"
+  mkdir -p "$dest"
+  local p
+  for p in "${PRESETS[@]}"; do show_md "$p" > "$dest/$p.md"; done
+  dump_all > "$dest/APPENDIX.md"
+  walk_dump > "$dest/WALKTHROUGH.md" 2>/dev/null || true
+  echo "wrote $dest"
+}
+
+trigger() {
+  cat <<'EOF'
+TRIGGER → SYSREPTOR FIELD
+  live host/ports     Appendix → Host & Service Discovery     cptsrep nmap FILE && cptsrep hosts
+  vhost               Appendix → Subdomain Discovery          cptsrep vhosts
+  vuln confirmed      Findings → +  AND Remediation row       cptsrep finding new <type>
+  foothold            Exploited Hosts + walkthrough start     cptsrep exploited; cptsrep walkthrough start HOST
+  user                Compromised Users                       cptsrep users
+  flag                Flags Discovered                        cptsrep flag N HOST VAL PATH METHOD
+  root / DC           walkthrough end + cleanup               cptsrep cleanup
+  hash dump           Domain Password Review                  (end of exam)
+  last 90 min         Assessment Overview + Publish
+EOF
+}
+
+next_steps() {
+  need_vault
+  echo "Empty / thin tables:"
+  local p n
+  for p in hosts flags exploited users; do
+    n=$(($(wc -l < "$(tsv_path "$p")" 2>/dev/null || echo 1)-1))
+    [[ $n -le 0 ]] && echo "  - fill $p  (cptsrep $p)"
+  done
+  [[ "$(ls "$VAULT/findings"/*.md 2>/dev/null | wc -l)" -eq 0 ]] && echo "  - cptsrep finding new ear"
+  [[ "$(ls "$VAULT/walkthrough"/*.md 2>/dev/null | wc -l)" -eq 0 ]] && echo "  - cptsrep walkthrough start <host>"
+  echo "cptsrep trigger   — full map"
+}
+
+scope_stub() {
+  cat <<'EOF'
+The scope of this engagement was limited to the assets provided by {{ report.customer_short }}:
+
+- Host / range:
+- Domain:
+
+All discovered services on in-scope hosts were considered in-scope.
+
+Out of scope:
+- Denial of Service attacks
+- Social engineering
+- Physical security testing
+EOF
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  -h|--help|help) usage ;;
+  version|-V) echo "$VERSION" ;;
+  init) init_vault "${1:-}" ;;
+  hosts|vhosts|exploited|users|flags|cleanup|findings|remediations) edit_preset "$cmd" ;;
+  edit) edit_preset "${1:?preset}" ;;
+  show) show_md "${1:?preset}" ;;
+  clip)
+    need_vault
+    md="$(show_md "${1:?preset}")"
+    printf '%s\n' "$md"
+    clip "$md" && echo "[clipboard]" >&2
+    ;;
+  add) add_row "${1:?preset}" "${*:2}" ;;
+  nmap) ingest_nmap "${1:-}" ;;
+  flag) add_flag "$@" ;;
+  dump) dump_all ;;
+  list|status) list_vault ;;
+  validate) validate ;;
+  export) export_md "${1:-}" ;;
+  finding-stub) finding_body "${1:-default}" "${1:-finding}" ;;
+  finding)
+    sub="${1:-list}"; shift || true
+    case "$sub" in
+      new) finding_new "${1:-default}" "${2:-$1}" ;;
+      list) finding_list ;;
+      edit) finding_edit "${1:?id}" ;;
+      *) die "finding new|list|edit" ;;
+    esac
+    ;;
+  walkthrough)
+    sub="${1:-dump}"; shift || true
+    case "$sub" in
+      start) walk_start "${1:?host}" ;;
+      edit) walk_start "${1:?host}" ;;
+      dump) walk_dump ;;
+      *) die "walkthrough start|edit|dump" ;;
+    esac
+    ;;
+  figure) figure_snip "${1:-fig}" "${*:2}" ;;
+  remediate) remediate "${1:-short}" "${2:-}" "${3:-}" ;;
+  trigger) trigger ;;
+  next) next_steps ;;
+  scope-stub) scope_stub ;;
+  approach-ok) echo "Leave Executive Summary → Approach as the stock template text." ;;
+  *) die "unknown: $cmd  (cptsrep help)" ;;
+esac
