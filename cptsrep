@@ -2,7 +2,7 @@
 # cptsrep v3 — CPTS / SysReptor workstation
 set -euo pipefail
 
-VERSION="3.0.0"
+VERSION="3.1.0"
 VAULT="${CPTSREP_VAULT:-$HOME/.cptsrep}"
 EDITOR_BIN="${EDITOR:-vim}"
 PRESETS=(hosts vhosts exploited users flags cleanup findings remediations)
@@ -46,10 +46,14 @@ FINDINGS
   cptsrep finding edit <id>
   cptsrep finding-stub [type]
 
-WALKTHROUGH
-  cptsrep walkthrough start <host>
-  cptsrep walkthrough edit <host>
-  cptsrep walkthrough dump
+WALKTHROUGH (one persistent file, section per box)
+  cptsrep path                    # vim ATTACKPATH.md (all boxes)
+  cptsrep path add <host>         # append a section, then vim-jump to it
+  cptsrep path edit <host>        # vim, cursor on that box
+  cptsrep path show <host>        # print only that box
+  cptsrep path list               # which boxes exist
+  cptsrep path dump               # full file for SysReptor walkthrough
+  cptsrep walkthrough start|edit|dump   # aliases of path add|edit|dump
 
 OTHER
   cptsrep add <preset> <tab-row>
@@ -75,6 +79,7 @@ ensure_preset() {
 init_vault() {
   VAULT="${1:-$VAULT}"
   mkdir -p "$VAULT/findings" "$VAULT/walkthrough" "$VAULT/export"
+  attackpath_ensure
   local p
   for p in "${PRESETS[@]}"; do
     [[ -f "$(tsv_path "$p")" ]] || header_of "$p" > "$(tsv_path "$p")"
@@ -570,66 +575,131 @@ finding_edit() {
   "$EDITOR_BIN" "$f"
 }
 
-walk_start() {
-  need_vault
-  local host="${1:-host}"
-  mkdir -p "$VAULT/walkthrough"
-  local f="$VAULT/walkthrough/${host}.md"
-  if [[ ! -f "$f" ]]; then
-    cat > "$f" <<EOF
-# $host
+attackpath_file() { echo "$VAULT/ATTACKPATH.md"; }
 
-The assessor targeted **$host** as part of the in-scope assessment.
+attackpath_seed() {
+  cat <<'EOF'
+# Internal Network Compromise Walkthrough
 
-## High-level
+Write in third person. One section per host. Do not delete the BEGIN/END markers.
+
+## High-level attack path
+
+The assessor progressed through the following hosts:
+
+- _(add a bullet when a box is finished)_
+
+EOF
+}
+
+attackpath_section() {
+  local host="$1"
+  cat <<EOF
+
+<!-- BEGIN: ${host} -->
+## ${host}
+
+The assessor targeted **${host}** as part of the in-scope assessment.
+
+### High-level
 - Recon
 - Foothold
 - User
 - Privilege escalation
 - Flags
 
-## Detailed reproduction
+### Detailed reproduction
 
-### Reconnaissance
-Command and ports. Figure.
+#### Reconnaissance
+Ports, vhosts, commands. Figure.
 
-### Foothold
+#### Foothold
+Finding reference. Exact command or HTTP request. Figure.
+
+#### User compromise
+Account. Method. Flag location.
+
+#### Privilege escalation
 Finding reference. Commands. Figure.
 
-### User compromise
-Account. How. Flag location.
+#### Pivot / next hop
+Credential or access taken to the next host.
 
-### Privilege escalation
-Finding reference. Commands. Figure.
-
-### Cleanup
+#### Cleanup
 Files dropped, services started.
+
+<!-- END: ${host} -->
 EOF
-  fi
-  "$EDITOR_BIN" "$f"
 }
 
-walk_dump() {
-  need_vault
-  echo "## Internal Network Compromise Walkthrough"
-  echo
-  echo "### High-level attack path"
-  echo
-  echo "The assessor progressed through the following hosts:"
-  echo
-  local f
-  for f in "$VAULT/walkthrough"/*.md; do
-    [[ -e "$f" ]] || continue
-    echo "- $(basename "$f" .md)"
-  done
-  echo
-  for f in "$VAULT/walkthrough"/*.md; do
-    [[ -e "$f" ]] || continue
-    echo
-    cat "$f"
-    echo
-  done
+attackpath_ensure() {
+  mkdir -p "$VAULT"
+  local f; f="$(attackpath_file)"
+  [[ -f "$f" ]] || attackpath_seed > "$f"
 }
+
+path_list() {
+  need_vault; attackpath_ensure
+  echo "file: $(attackpath_file)"
+  if grep -q '<!-- BEGIN:' "$(attackpath_file)"; then
+    grep -oP '(?<=<!-- BEGIN: ).*(?= -->)' "$(attackpath_file)" | awk '{print NR". "$0}'
+  else
+    echo "(no boxes yet — cptsrep path add <host>)"
+  fi
+}
+
+path_has() {
+  grep -q "<!-- BEGIN: $1 -->" "$(attackpath_file)"
+}
+
+path_add() {
+  need_vault; attackpath_ensure
+  local host="${1:-}"
+  [[ -n "$host" ]] || die "usage: cptsrep path add <host>"
+  if path_has "$host"; then
+    echo "section exists: $host" >&2
+  else
+    attackpath_section "$host" >> "$(attackpath_file)"
+    echo "added section: $host" >&2
+  fi
+  path_edit "$host"
+}
+
+path_show() {
+  need_vault; attackpath_ensure
+  local host="${1:-}"
+  [[ -n "$host" ]] || die "usage: cptsrep path show <host>"
+  path_has "$host" || die "no section for $host — cptsrep path add $host"
+  awk -v h="$host" '
+    $0=="<!-- BEGIN: "h" -->" {p=1}
+    p {print}
+    $0=="<!-- END: "h" -->" {p=0}
+  ' "$(attackpath_file)"
+}
+
+path_edit() {
+  need_vault; attackpath_ensure
+  local host="${1:-}" f; f="$(attackpath_file)"
+  if [[ -n "$host" ]]; then
+    path_has "$host" || attackpath_section "$host" >> "$f"
+    if [[ "$EDITOR_BIN" == *vim* || "$EDITOR_BIN" == *nvim* ]]; then
+      "$EDITOR_BIN" -c "set foldmethod=marker foldmarker=BEGIN:,END:" \
+        -c "/<!-- BEGIN: ${host} -->" "$f"
+    else
+      "$EDITOR_BIN" "$f"
+    fi
+  else
+    "$EDITOR_BIN" "$f"
+  fi
+}
+
+path_dump() {
+  need_vault; attackpath_ensure
+  cat "$(attackpath_file)"
+}
+
+walk_start() { path_add "${1:?host}"; }
+walk_dump()  { path_dump; }
 
 figure_snip() {
   local id="${1:-fig1}" caption="${2:-Caption}"
@@ -714,7 +784,10 @@ list_vault() {
     printf '  %-14s %2d row(s)\n' "$p" "$n"
   done
   echo "  findings dir    $(ls "$VAULT/findings"/*.md 2>/dev/null | wc -l) file(s)"
-  echo "  walkthroughs    $(ls "$VAULT/walkthrough"/*.md 2>/dev/null | wc -l) file(s)"
+  echo "  attack path     $(attackpath_file)"
+  if [[ -f "$(attackpath_file)" ]]; then
+    echo "  boxes           $(grep -c '<!-- BEGIN:' "$(attackpath_file)" || echo 0)"
+  fi
 }
 
 export_md() {
@@ -806,10 +879,21 @@ case "$cmd" in
   walkthrough)
     sub="${1:-dump}"; shift || true
     case "$sub" in
-      start) walk_start "${1:?host}" ;;
-      edit) walk_start "${1:?host}" ;;
-      dump) walk_dump ;;
+      start) path_add "${1:?host}" ;;
+      edit) path_edit "${1:?host}" ;;
+      dump) path_dump ;;
       *) die "walkthrough start|edit|dump" ;;
+    esac
+    ;;
+  path)
+    sub="${1:-edit}"; shift || true
+    case "$sub" in
+      add) path_add "${1:?host}" ;;
+      edit|"") path_edit "${1:-}" ;;
+      show) path_show "${1:?host}" ;;
+      list) path_list ;;
+      dump) path_dump ;;
+      *) die "path add|edit|show|list|dump" ;;
     esac
     ;;
   figure) figure_snip "${1:-fig}" "${*:2}" ;;
